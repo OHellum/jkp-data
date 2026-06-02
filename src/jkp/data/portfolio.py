@@ -174,7 +174,8 @@ def portfolios(
     # characerteristics data
     file_path = f"{data_path}/characteristics/{excntry}.parquet"
 
-    # Select the required columns
+    # Select the required columns. be_me is always loaded (used for per-leg B/M
+    # attributes); guard against duplication when "be_me" itself is also a char.
     columns = (
         [
             "id",
@@ -189,6 +190,7 @@ def portfolios(
             "gics",
             "ff49",
         ]
+        + (["be_me"] if "be_me" not in chars else [])
         + chars
         + ["excntry"]
     )
@@ -424,6 +426,8 @@ def portfolios(
                         "crsp_exchcd",
                         "comp_exchg",
                         "bp_stock",
+                        "be_me",
+                        "ff49",
                     ]
                 )
             )
@@ -472,10 +476,66 @@ def portfolios(
                     (
                         (pl.col("ret_exc_lead1m") * pl.col("me_cap")).sum() / pl.col("me_cap").sum()
                     ).alias("ret_vw_cap"),
+                    # Market equity
+                    pl.col("me").sum().alias("me_total"),
+                    pl.col("me").mean().alias("me_mean"),
+                    # Book-to-market, null-safe (nulls excluded from numerator and denominator)
+                    pl.col("be_me").mean().alias("be_me_ew"),
+                    (
+                        (pl.col("be_me") * pl.col("me"))
+                        .filter(pl.col("be_me").is_not_null())
+                        .sum()
+                        / pl.col("me").filter(pl.col("be_me").is_not_null()).sum()
+                    ).alias("be_me_vw"),
+                    (
+                        (pl.col("be_me") * pl.col("me_cap"))
+                        .filter(pl.col("be_me").is_not_null())
+                        .sum()
+                        / pl.col("me_cap").filter(pl.col("be_me").is_not_null()).sum()
+                    ).alias("be_me_vw_cap"),
+                    pl.col("be_me").is_not_null().sum().alias("n_be_me"),
+                    # Stock-level HHI over VW and VW-cap weights
+                    ((pl.col("me") / pl.col("me").sum()) ** 2).sum().alias("hhi_stock_vw"),
+                    ((pl.col("me_cap") / pl.col("me_cap").sum()) ** 2)
+                    .sum()
+                    .alias("hhi_stock_vw_cap"),
                 ]
             )
             .with_columns(pl.col("eom").dt.offset_by("1mo").dt.month_end().alias("eom"))
         )
+
+        # Two-stage industry HHI: aggregate me to (pf, eom, ff49), then sum squared
+        # industry weights back to (pf, eom). Null ff49 excluded.
+        hhi_ind_x = (
+            sub.filter(pl.col("ff49").is_not_null())
+            .group_by(["pf", "eom", "ff49"])
+            .agg(
+                [
+                    pl.col("me").sum().alias("ind_me"),
+                    pl.col("me_cap").sum().alias("ind_me_cap"),
+                ]
+            )
+            .with_columns(
+                [
+                    (pl.col("ind_me") / pl.col("ind_me").sum().over(["pf", "eom"])).alias(
+                        "ind_w_vw"
+                    ),
+                    (pl.col("ind_me_cap") / pl.col("ind_me_cap").sum().over(["pf", "eom"])).alias(
+                        "ind_w_vw_cap"
+                    ),
+                ]
+            )
+            .group_by(["pf", "eom"])
+            .agg(
+                [
+                    (pl.col("ind_w_vw") ** 2).sum().alias("hhi_ff49_vw"),
+                    (pl.col("ind_w_vw_cap") ** 2).sum().alias("hhi_ff49_vw_cap"),
+                ]
+            )
+            .with_columns(pl.col("eom").dt.offset_by("1mo").dt.month_end().alias("eom"))
+        )
+
+        pf_returns_x = pf_returns_x.join(hhi_ind_x, on=["pf", "eom"], how="left")
 
         if signals:
             # Eager path: collect immediately, then compute pf_signals.
@@ -1108,6 +1168,16 @@ def run_portfolio(*, output_format: str = "parquet", output_dir: Path) -> None:
                 "ret_ew",
                 "ret_vw",
                 "ret_vw_cap",
+                "me_total",
+                "me_mean",
+                "be_me_ew",
+                "be_me_vw",
+                "be_me_vw_cap",
+                "n_be_me",
+                "hhi_stock_vw",
+                "hhi_stock_vw_cap",
+                "hhi_ff49_vw",
+                "hhi_ff49_vw_cap",
             ]
         )
         pf_returns = pf_returns.sort(["excntry", "characteristic", "pf", "eom"])
@@ -1196,36 +1266,62 @@ def run_portfolio(*, output_format: str = "parquet", output_dir: Path) -> None:
     else:
         ff49_daily = None
 
+    # Columns carried per-leg from pf_returns into hml/lms as _long / _short pairs.
+    # In hml: _long = pf=pfs (high signal), _short = pf=1 (low signal).
+    # In lms: _long = direction-adjusted long side (swapped when direction=-1).
+    leg_attr_cols = [
+        "ret_ew",
+        "ret_vw",
+        "ret_vw_cap",
+        "me_total",
+        "me_mean",
+        "be_me_ew",
+        "be_me_vw",
+        "be_me_vw_cap",
+        "n_be_me",
+        "hhi_stock_vw",
+        "hhi_stock_vw_cap",
+        "hhi_ff49_vw",
+        "hhi_ff49_vw_cap",
+    ]
+
     # Create HML Returns
     if pf_returns is not None and pf_returns.height > 0:
-        hml_returns = pf_returns.group_by(["excntry", "characteristic", "eom"]).agg(
-            [
-                pl.col("pf").is_in([settings["pfs"], 1]).sum().alias("pfs"),
-                (
-                    pl.col("signal").filter(pl.col("pf") == settings["pfs"]).first()
-                    - pl.col("signal").filter(pl.col("pf") == 1).first()
-                ).alias("signal"),
-                (
-                    pl.col("n").filter(pl.col("pf") == settings["pfs"]).first()
-                    + pl.col("n").filter(pl.col("pf") == 1).first()
-                ).alias("n_stocks"),
-                (pl.col("n").filter(pl.col("pf").is_in([settings["pfs"], 1])).min()).alias(
-                    "n_stocks_min"
-                ),
-                (
-                    pl.col("ret_ew").filter(pl.col("pf") == settings["pfs"]).first()
-                    - pl.col("ret_ew").filter(pl.col("pf") == 1).first()
-                ).alias("ret_ew"),
-                (
-                    pl.col("ret_vw").filter(pl.col("pf") == settings["pfs"]).first()
-                    - pl.col("ret_vw").filter(pl.col("pf") == 1).first()
-                ).alias("ret_vw"),
-                (
-                    pl.col("ret_vw_cap").filter(pl.col("pf") == settings["pfs"]).first()
-                    - pl.col("ret_vw_cap").filter(pl.col("pf") == 1).first()
-                ).alias("ret_vw_cap"),
-            ]
-        )
+        hml_agg_exprs = [
+            pl.col("pf").is_in([settings["pfs"], 1]).sum().alias("pfs"),
+            (
+                pl.col("signal").filter(pl.col("pf") == settings["pfs"]).first()
+                - pl.col("signal").filter(pl.col("pf") == 1).first()
+            ).alias("signal"),
+            (
+                pl.col("n").filter(pl.col("pf") == settings["pfs"]).first()
+                + pl.col("n").filter(pl.col("pf") == 1).first()
+            ).alias("n_stocks"),
+            (pl.col("n").filter(pl.col("pf").is_in([settings["pfs"], 1])).min()).alias(
+                "n_stocks_min"
+            ),
+            (
+                pl.col("ret_ew").filter(pl.col("pf") == settings["pfs"]).first()
+                - pl.col("ret_ew").filter(pl.col("pf") == 1).first()
+            ).alias("ret_ew"),
+            (
+                pl.col("ret_vw").filter(pl.col("pf") == settings["pfs"]).first()
+                - pl.col("ret_vw").filter(pl.col("pf") == 1).first()
+            ).alias("ret_vw"),
+            (
+                pl.col("ret_vw_cap").filter(pl.col("pf") == settings["pfs"]).first()
+                - pl.col("ret_vw_cap").filter(pl.col("pf") == 1).first()
+            ).alias("ret_vw_cap"),
+        ]
+        for col in leg_attr_cols:
+            hml_agg_exprs.append(
+                pl.col(col).filter(pl.col("pf") == settings["pfs"]).first().alias(f"{col}_long")
+            )
+            hml_agg_exprs.append(
+                pl.col(col).filter(pl.col("pf") == 1).first().alias(f"{col}_short")
+            )
+
+        hml_returns = pf_returns.group_by(["excntry", "characteristic", "eom"]).agg(hml_agg_exprs)
 
         hml_returns = hml_returns.filter(pl.col("pfs") == 2).drop("pfs")
         hml_returns = hml_returns.sort(["excntry", "characteristic", "eom"])
@@ -1233,11 +1329,29 @@ def run_portfolio(*, output_format: str = "parquet", output_dir: Path) -> None:
         # Create Long-Short Factors [Sign Returns to be consistent with original paper]
         lms_returns = char_info.join(hml_returns, on="characteristic", how="left")
 
-        # Define columns to be modified
+        # Flip spread return/signal sign by direction (existing behavior)
         resign_cols = ["signal", "ret_ew", "ret_vw", "ret_vw_cap"]
         lms_returns = lms_returns.with_columns(
-            [pl.col(var) * pl.col("direction").alias(var) for var in resign_cols]
+            [(pl.col(var) * pl.col("direction")).alias(var) for var in resign_cols]
         )
+
+        # For per-leg columns, swap _long and _short when direction == -1 so that
+        # _long always means the portfolio-long (positive LS) side after direction.
+        swap_exprs = []
+        for col in leg_attr_cols:
+            swap_exprs.append(
+                pl.when(pl.col("direction") == -1)
+                .then(pl.col(f"{col}_short"))
+                .otherwise(pl.col(f"{col}_long"))
+                .alias(f"{col}_long")
+            )
+            swap_exprs.append(
+                pl.when(pl.col("direction") == -1)
+                .then(pl.col(f"{col}_long"))
+                .otherwise(pl.col(f"{col}_short"))
+                .alias(f"{col}_short")
+            )
+        lms_returns = lms_returns.with_columns(swap_exprs)
     else:
         hml_returns = None
         lms_returns = None
@@ -1296,17 +1410,26 @@ def run_portfolio(*, output_format: str = "parquet", output_dir: Path) -> None:
 
     # Create Clustered Portfolios
     if lms_returns is not None:
+        cluster_agg_exprs = [
+            pl.len().alias("n_factors"),
+            pl.col("ret_ew").mean().alias("ret_ew"),
+            pl.col("ret_vw").mean().alias("ret_vw"),
+            pl.col("ret_vw_cap").mean().alias("ret_vw_cap"),
+        ]
+        # Average per-leg attributes across factors in the cluster. For a theme
+        # portfolio defined as EW across factors and VW within each factor, this
+        # averaging yields the exact VW mean B/M of the theme (the weights
+        # algebra collapses). For me_total and HHI it is the mean across factor
+        # legs within the theme — a scale/concentration summary consistent with
+        # how cluster returns are already formed by averaging factor returns.
+        for col in leg_attr_cols:
+            cluster_agg_exprs.append(pl.col(f"{col}_long").mean().alias(f"{col}_long"))
+            cluster_agg_exprs.append(pl.col(f"{col}_short").mean().alias(f"{col}_short"))
+
         cluster_pfs = (
             lms_returns.join(cluster_labels, on="characteristic", how="left")
             .group_by(["excntry", "cluster", "eom"])
-            .agg(
-                [
-                    pl.len().alias("n_factors"),
-                    pl.col("ret_ew").mean().alias("ret_ew"),
-                    pl.col("ret_vw").mean().alias("ret_vw"),
-                    pl.col("ret_vw_cap").mean().alias("ret_vw_cap"),
-                ]
-            )
+            .agg(cluster_agg_exprs)
         )
     else:
         cluster_pfs = None
